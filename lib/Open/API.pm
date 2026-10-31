@@ -1,0 +1,783 @@
+package Open::API;
+
+use 5.008003;
+use strict;
+use warnings;
+use Carp ();
+
+our $VERSION = '0.15';
+
+require XSLoader;
+XSLoader::load('Open::API', $VERSION);
+
+Carp::croak(
+	"Open::API requires JSON::Schema::Fast built with its C ABI "
+	. "(JSON::Schema::Fast 0.04 or later); please upgrade or reinstall it"
+) unless _abi_ok();
+
+1;
+
+__END__
+
+=head1 NAME
+
+Open::API - OpenAPI 2.0, 3.0 and 3.1 server and client
+
+=head1 VERSION
+
+Version 0.15
+
+=head1 SYNOPSIS
+
+    use Open::API;
+
+    # a spec: hashref, JSON text, YAML text, or a filename
+    my $api = Open::API->new(spec => 'openapi.json');
+
+    # the compiled spec drives a PSGI app (see Open::API::Plack) ...
+    my $app = Open::API::Plack->new(
+        api      => $api,
+        handlers => {
+            listPets => 'MyApp::Pets::list',
+            getPet   => sub { ... },
+        },
+    )->to_app;
+
+    # ... and an HTTP client (see Open::API::Client)
+    my $client = Open::API::Client->new(
+        api => $api,
+        base_url => 'http://127.0.0.1:5000'
+    );
+    my $res = $client->getPet(petId => 42)->get;
+
+=head1 DESCRIPTION
+
+C<Open::API> loads an OpenAPI 3.0 or 3.1 document, or a Swagger 2.0 one, once
+and compiles every
+parameter, header, cookie and body schema through L<JSON::Schema::Fast> at
+startup. Each request is then routed and validated on a C hot path.
+
+The compiled object is the shared core of two consumers: L<Open::API::Plack>
+serves it as a PSGI app (routing, validation, security, CSRF, CORS - all in
+C before a handler runs), and L<Open::API::Client> is a spec-driven HTTP
+client on L<Fetch>'s C ABI, so one document defines both sides of the wire.
+The L</match> and L</validate_request> methods below expose the router and
+validator directly for any other framework adapter.
+
+=head1 OPENAPI VERSIONS
+
+A 3.1 Schema Object B<is> JSON Schema 2020-12, which is what
+JSON::Schema::Fast validates, so a 3.1 document reaches the validator
+unchanged.
+
+A 3.0 Schema Object is a different dialect - an extended subset of JSON Schema
+Wright draft-00 - so a 3.0 document is rewritten into 3.1 shape once, at load,
+before anything else sees it. L</spec> then returns the normalised document,
+which means the validator, the mock generator, the docs UI and any consumer
+walking C<< $api->spec >> all deal in one schema dialect.
+
+A Swagger 2.0 document (C<< swagger: "2.0" >>, the string) is accepted too. Its
+Schema Object is a draft-04 subset of 3.0's, so the document is first brought
+to 3.0 shape and then through the same rewrite, all at load; see
+L</SWAGGER 2.0> for what that means. Any other C<openapi> or C<swagger> value
+croaks at load, as does a document declaring both.
+
+What the up-conversion does, per Schema Object:
+
+=over 4
+
+=item * C<nullable: true> widens C<type> into a union with C<"null">
+(C<< {type => 'string'} >> becomes C<< {type => ['string','null']} >>). With no
+C<type>, a C<nullable> C<enum> gains a null member; beside a C<$ref> the pair
+becomes C<< anyOf => [ {$ref}, {type => 'null'} ] >>, the idiom 3.1 uses.
+C<nullable: false> is simply dropped.
+
+=item * The boolean C<exclusiveMinimum> / C<exclusiveMaximum> fold into the
+numeric 2020-12 form: C<< {minimum => 5, exclusiveMinimum => true} >> becomes
+C<< {exclusiveMinimum => 5} >>. C<false>, or a C<true> with no bound to attach
+to, is dropped.
+
+=item * Tuple C<items> becomes C<prefixItems>, and C<additionalItems> becomes
+C<items>. (An array C<items> is not legal 3.0, but specs carry the draft-04
+habit and the intent is unambiguous.)
+
+=item * Schema-level C<example> becomes C<< examples => [ $value ] >>. A
+B<media type> C<example> is an Example Object, not a schema keyword, and is
+left alone.
+
+=item * C<format: byte> gains C<contentEncoding: base64> and C<format: binary>
+gains C<contentMediaType: application/octet-stream>. The C<format> stays too:
+it is inert to the validator, and the docs UI recognises either spelling.
+
+=item * Keywords beside a C<$ref> are ignored, as 3.0 requires. Annotations
+(C<description>, C<title>, C<default>, ...) ride along because they cannot
+change a verdict; assertions are dropped. Without this a request that a
+3.0-conformant gateway accepts could be rejected here.
+
+=back
+
+Values are never rewritten. C<example>, C<default> and C<enum> hold arbitrary
+user JSON that may itself contain a key called C<nullable> or C<items>, so the
+walk descends only through positions where a Schema Object can actually appear.
+
+The normalised document keeps its original C<openapi> string (or its C<swagger>
+string) - a document should not lie about what it was - so the conversion is
+idempotent: C<< Open::API->new(spec => $api->spec) >> is a no-op. Use
+L</openapi_version> to tell the dialects apart.
+
+=head1 SWAGGER 2.0
+
+A Swagger 2.0 document is rewritten into 3.0 shape at load, and the 3.0 rules
+above then apply to its schemas. L</spec> returns the result, 3.1-shaped like
+everything else, with C<swagger: "2.0"> still on it. What moves where:
+
+=over 4
+
+=item * C<host>, C<basePath> and C<schemes> become C<servers>: one Server
+Object per scheme, C<scheme://host/basePath>. A host with no C<schemes> gives
+the scheme-relative C<//host/basePath>; a C<basePath> alone is a relative URL.
+The base path is honoured by routing only with C<< servers => 1 >> (see
+L</new>), exactly as a 3.x server prefix is.
+
+=item * C<definitions>, C<parameters>, C<responses> and C<securityDefinitions>
+become the matching C<components> sections, and every C<$ref> into them is
+rewritten (C<#/definitions/Pet> becomes C<#/components/schemas/Pet>). A body
+parameter definition becomes a component request body.
+
+=item * C<basic> becomes C<< http/basic >>; an oauth2 C<flow> becomes the
+matching entry of C<flows> (C<application> is C<clientCredentials>,
+C<accessCode> is C<authorizationCode>), carrying its URLs and scopes.
+
+=item * A body parameter becomes the operation's request body, keyed by the
+effective C<consumes>; formData parameters become one form body, keyed by the
+form types in C<consumes>, with an Encoding Object entry per array member and
+C<type: file> as a binary string. A response C<schema> is keyed by the
+effective C<produces>, a response C<examples> map becomes each media type's
+C<example>, and a Header Object's inline type becomes its C<schema>.
+
+=item * A parameter's inline type keywords (C<type>, C<format>, C<items>,
+C<enum>, the bounds, ...) become its C<schema>. C<collectionFormat> becomes
+C<style> and C<explode> where 3.x can say it (csv on a query array is
+C<< form, explode: false >>, since 2.0's default is not exploded while 3.x's
+is; C<multi> is exploded; C<ssv> and C<pipes> are the delimited query styles)
+and the C<x-oa-collectionFormat> extension where it cannot: C<tsv> anywhere,
+C<ssv> and C<pipes> in a path or header, and each level of a nested Items
+Object. The extension is read on a 3.x document too, so a 3.1 document may
+declare a tab-separated or nested list directly.
+
+=back
+
+Where 2.0 declares no media type the conversion chooses one: a body with no
+C<consumes> is C<application/json>, formData is
+C<application/x-www-form-urlencoded> (or C<multipart/form-data> when a member
+is a file), and a response schema with no C<produces> is C<application/json>.
+An operation-level C<consumes: []> clears the root list and falls to that
+default.
+
+Everything the specification says MUST is refused at load: a missing C<paths>
+or C<responses>, a host carrying a scheme or a path, a body beside formData or
+two bodies, a type array in a schema, a discriminator property not in
+C<required>, a C<2XX> response key (3.0's, not 2.0's), apiKey in a cookie, an
+oauth2 scheme without its flow, URLs or scopes. What it does not say is left
+alone: C<nullable> is not a 2.0 keyword and is dropped (draft-04 ignores what
+it does not know), while C<oneOf>, C<anyOf> and C<not> are honoured if present
+although 2.0 does not define them, and every C<x-> extension travels untouched.
+
+=head1 DISCRIMINATOR
+
+A C<discriminator> names the property whose value says which schema a payload
+really is. Both the forms OpenAPI defines are supported, in 3.0 and 3.1 alike:
+
+    # a discriminated union
+    PetUnion:
+      oneOf: [ {$ref: '#/components/schemas/Dog'},
+               {$ref: '#/components/schemas/Cat'} ]
+      discriminator:
+        propertyName: petType
+        mapping: { dog: Dog, cat: Cat }     # optional
+
+    # inheritance: the children are found by their allOf reference to the base
+    Pet:
+      type: object
+      required: [petType]
+      discriminator: { propertyName: petType }
+    Dog:
+      allOf: [ {$ref: '#/components/schemas/Pet'}, {...} ]
+
+Once a schema is compiled, L<JSON::Schema::Fast> owns the traversal, so the
+discriminator is expanded at load into the 2020-12 constructs that express it:
+a guard that the property is present and names a known branch, then one
+C<if>/C<then> per branch. The validator therefore needs to know nothing about
+OpenAPI, and the payload is weighed against the branch it named rather than
+against every branch at once - which is the point, because two branches a
+payload both satisfies make a bare C<oneOf> fail however clear the document
+was about which one was meant. It also means a failure reports the branch's own
+error (C<bark> is missing) instead of C<< failed 'oneOf' >>.
+
+A value with no mapping entry is rejected, as the specification requires: it
+fails the guard's C<enum> with the discriminator property as its
+C<instanceLocation>.
+
+Where a mapping is not given it is derived - from the branch C<$ref>s, or from
+the schemas that inherit from the base - and written back into the document, so
+C<< $api->spec >> always shows an explicit mapping. The generated subschemas
+carry an C<x-oa-discriminator> key: it marks them as derived rather than
+declared, and it is what lets a second pass rebuild them instead of appending
+to them.
+
+A discriminator with nothing to dispatch on - no mapping, no union, no
+children - stays an inert annotation.
+
+The mock generator honours the discriminator too, so a mocked union is a
+coherent member of it rather than a fold of all of them.
+
+=head1 CONSTRUCTOR
+
+=head2 new
+
+    my $api = Open::API->new(spec => $spec);
+
+C<spec> is required and may be:
+
+=over 4
+
+=item * a hashref (an already-decoded document),
+
+=item * a string of JSON text,
+
+=item * a string of YAML text (decoded with L<YAML::XS>, loaded lazily -
+only YAML specs need it), or
+
+=item * a filename (C<.json>, C<.yaml> or C<.yml>; anything else is sniffed by
+content).
+
+=back
+
+    my $api = Open::API->new(spec => $spec, servers => 1);
+
+C<servers> is optional and off by default. With it, the path prefix carried by
+the first Server Object's URL is stripped before routing, and any
+C<{variable}> in that URL is expanded from its declared default - so a
+document whose server is C<https://host/api/v1> answers C<GET /api/v1/pets>
+for a path written C</pets>. A scheme-relative URL (C<//host/api/v1>, which a
+Swagger 2.0 C<host> with no C<schemes> converts to) yields its path the same
+way.
+
+It is off by default deliberately. An application that already mounts itself
+so that C<PATH_INFO> arrives without the prefix would start seeing every
+request miss, and a routing change of that shape shows up as a silent 404
+rather than an error. Turn it on when the server sees the prefix.
+
+Compilation walks C<paths> once: every operation needs a unique
+C<operationId> (it is the dispatch key), path templates are pre-split,
+path-item and operation C<parameters> are merged (operation wins), and every
+schema is compiled through the JSF ABI - parameters with coercion enabled
+(string sources satisfy typed schemas, exactly what OpenAPI parameters need)
+and C<default>-filling on. C<$ref>s to C<#/components/schemas/...> are
+resolved at compile time. A malformed document, a missing or duplicate
+operationId, or an unresolvable reference croaks here, at startup.
+
+A parameter may be declared with C<content> instead of C<schema>, which means
+it carries a whole document in one value:
+
+    - name: filter
+      in: query
+      content:
+        application/json:
+          schema: { type: object, properties: { field: {type: string} } }
+
+The value is decoded to its media type before its schema sees it, so
+C<?filter=%7B%22field%22%3A%22name%22%7D> is validated as the object it
+represents; a value that will not decode is a 400 rather than a silent pass.
+Such a parameter is compiled B<without> coercion - a decoded document already
+has the types the schema is talking about - and, being one document rather than
+a repeated key, an arrayref value is its content and not a list of values. A
+media type with no decoder is passed through unvalidated, exactly as an
+undeclared request body type is. L<Open::API::Client> encodes these the same
+way round: pass a structure and it travels as JSON.
+
+=head1 METHODS
+
+=head2 spec
+
+The decoded OpenAPI document, normalised: 3.1-shaped whatever version it
+declared (3.1, 3.0 or Swagger 2.0), with any C<discriminator> expanded. See
+L</OPENAPI VERSIONS>, L</SWAGGER 2.0> and L</DISCRIMINATOR>.
+
+=head2 openapi_version
+
+    my $v = $api->openapi_version;   # '3.0.3', '3.1.0' or '2.0'
+
+The version the document declares: its C<openapi> string, or C<'2.0'> for a
+Swagger document (which declares C<swagger>, not C<openapi>; the method name is
+historical). A 3.0 or 2.0 document keeps its own version string after
+conversion, so this reports the dialect it was written in even though L</spec>
+is 3.1-shaped throughout.
+
+=head2 operations
+
+    my $ops = $api->operations;   # [ { operationId, method, path }, ... ]
+
+=head2 operation
+
+    my $info = $api->operation('getPet');
+
+A description of one operation: C<params> by location (name + required),
+C<body> (required flag + content types) and C<responses> (statuses with
+compiled schemas). C<undef> for an unknown id.
+
+=head2 match
+
+    my ($opId, $captures) = $api->match($method => $path);
+
+The router alone: C<($operationId, \%raw_path_captures)> on a match; an empty
+list for a 404; C<(undef, \@allow)> when the path exists but the method does
+not (a 405 and its Allow list). For framework adapters.
+
+=head2 validate_request
+
+    my ($ok, $result) = $api->validate_request($opId, {
+        path   => \%raw_captures,
+        query  => $query_string_or_hashref,
+        header => \%lowercased_headers,
+        body   => $raw_body_or_decoded_ref,
+    });
+
+The validator alone: C<(1, \%params)> or C<(0, \@errors)>. Header names must
+be lowercased by the caller; cookies are parsed from the C<cookie> header when
+the operation declares cookie parameters. For framework adapters - together
+with L</match> this is the complete integration surface, everything heavy
+stays in C.
+
+=head2 validate_env
+
+    my ($ok, $result) = $api->validate_env($opId, $env, \%captures, $body);
+
+L</validate_request> for a PSGI environment, and the same answer:
+C<(1, \%params)> or C<(0, \@errors)>. The difference is where the work
+happens. The header hash is built in C from C<$env>, and only for the headers
+this operation actually declares, so a document with two header parameters
+does not pay for the forty a browser sent.
+
+C<\%captures> are the raw path captures L</match> returned; C<$body> is the
+request body, already read. Both may be omitted.
+
+=head2 check_op_security
+
+    my $denied = $api->check_op_security($opId, $env, \%checkers);
+
+Weigh a request against the C<security> the document requires of an operation.
+C<\%checkers> maps a scheme name to a coderef, called as
+
+    $checker->($credential, $env, $opId, \@scopes)
+
+and returning true to admit the request. The credential is extracted per the
+scheme's own declaration, so a checker is handed the token rather than the
+header it arrived in.
+
+Returns C<undef> when the request may proceed, or a PSGI triplet to answer
+with. Requirements are an OR of ANDs: one satisfied alternative admits the
+request, and an operation's own C<security> replaces the document-level one
+rather than adding to it.
+
+=head2 check_response
+
+    my $errors = $api->check_response($opId, $triplet, \%opts);
+
+Weigh a PSGI response against the schema the document declares for its
+status. Returns the error list for a mismatch and C<undef> for everything
+else - a conforming response, an unsampled one, or one skipped by a rule
+below. B<The triplet is never modified>, whatever the verdict: a gateway
+that edits what the upstream sent is not a gateway.
+
+Options: C<sample> validates one response in N for this operation, and
+C<max_body> skips bodies over that many bytes.
+
+A response is checked only if it passes the sampling gate and then every
+skip rule, in this order:
+
+=over 4
+
+=item * B<content type> - the C<Content-Type> is not one the document
+declares a JSON schema under (C<skip_ctype>).
+
+=item * B<size> - with C<max_body> set, C<Content-Length> is absent or
+over it (C<skip_size>). An unmeasured body is not buffered to find out.
+
+=item * B<body shape> - the body is not a plain scalar: a filehandle, a
+streaming coderef, an SSE writer (C<skip_body>). Never read.
+
+=item * B<schema> - the status declares no schema, so there is nothing to
+weigh it against (C<skip_schema>).
+
+=item * B<decode> - the body does not decode as JSON (C<skip_decode>).
+
+=back
+
+The gate comes first so an unsampled response costs one increment and one
+comparison. It is a per-operation counter rather than a random draw:
+cheaper, and a stable denominator.
+
+=head2 response_coverage
+
+    my $cov = $api->response_coverage('getPet');
+    my $all = $api->response_coverage;
+
+The counters behind that, for one operation or for every operation that
+has seen a response: C<total>, C<sampled>, C<unsampled>, C<checked>,
+C<violations>, and C<skip_ctype>, C<skip_size>, C<skip_body>,
+C<skip_schema>, C<skip_decode>.
+
+Every response is either checked or skipped for exactly one named reason,
+which is the point: what was not looked at is a number you can report, not
+a gap you have to assume away.
+
+=head2 synthesize
+
+    my $trip = $api->synthesize('getPet');
+    my $trip = $api->synthesize('getPet', { code => 404 });
+    my $trip = $api->synthesize('getPet', { prefer => $env->{HTTP_PREFER} });
+
+A response for an operation, from the document alone, as a PSGI triplet -
+this is what serves a mock. The body is, in order of precedence: the
+media type's C<example>; a named C<examples> entry when
+C<< example => 'name' >> (or a C<Prefer: example=name> token) asked for
+one, the lexicographically first entry otherwise; the schema's
+C<default>; a value generated from the schema (types, C<enum> first
+member, C<const>, C<format>-aware strings, objects with C<required>
+members only, C<allOf>/C<oneOf>/C<anyOf>).
+
+B<Deterministic.> The same arguments give byte-identical bodies: nothing
+below draws a random value, and the body is encoded canonically (sorted
+keys), so not even hash order leaks in - the property holds across
+processes, not merely within one.
+
+=head3 Arrays
+
+An array is generated with five elements. Not zero, which is what an
+absent C<minItems> literally means and which is a correct answer to the
+wrong question - a list endpoint that mocks as C<[]> validates perfectly
+and shows the caller nothing about the shape of what they will get. Not
+one either: a single-element list is a shape nobody can build a table, a
+pagination control or an empty state against.
+
+C<minItems> raises that and C<maxItems> caps it, C<maxItems: 0>
+included - there the document has said it means empty and it is
+believed.
+
+Integer members whose names identify a thing - C<id>, C<petId>,
+C<order_id> - get the element's index added, so five rows are five rows
+rather than the same row five times. It stays deterministic, because the
+index is a position and not a counter, and it stays valid, because a
+value that would pass C<maximum> is left alone.
+
+=head3 The request
+
+    $api->synthesize('showPet', { path => { petId => 42 } });
+    # { "id": 42, "name": "string" }
+
+Given the request's path captures, a response property the request has
+already answered is answered with what the request said. C<GET /pets/42>
+replying with C<id> 0 is a mock nobody can develop a client against.
+
+A capture matches a property by the same name, the same name in any
+case, and then the convention every REST document uses - a path
+templated C<{petId}> naming the resource whose schema calls the field
+C<id>. That last rule applies only when exactly one capture ends in
+C<id>: C</pets/{petId}/toys/{toyId}> has two and there is no honest way
+to say which one a nested C<id> means, so it generates rather than
+guesses.
+
+B<The guarantee outranks the convenience.> A captured value is used only
+when it fits the property's schema - the declared type (numeric strings
+are coerced), C<enum>, C<const>, the numeric bounds and the length
+bounds. Anything that does not fit falls back to generation, and a
+schema carrying a C<pattern> falls back too, because a regex this does
+not evaluate is a rule it cannot honour. The mock still cannot produce
+something its own validator would reject.
+
+Status selection: C<< code => N >> (or a C<Prefer: code=N> token) picks a
+declared status; without one the lowest declared 2xx wins, then
+C<default> (answered as 200), then the lowest declared status. A
+preferred status the document does not declare is still answered - with
+the C<default> response's body when one is declared, empty otherwise -
+because C<Prefer> exists to exercise error handling. A response that
+declares no JSON content (a C<204>, a bare error) answers with an empty
+body and no content type.
+
+Explicit C<code>/C<example> keys win over the C<prefer> string. Croaks on
+an unknown operationId.
+
+=head2 operation_info
+
+    my $info = $api->operation_info('getPet');
+
+The compiled contract for an operation - what will actually be checked,
+after C<$ref> resolution: C<operationId>, C<method>, C<path>,
+C<parameters> (each with C<name>, C<in>, C<required>, C<schema>), C<body>
+and C<body_required>, C<responses> (each with C<status>, C<content_type>
+and whether it is C<validated>), and C<secured>.
+
+This is the compiled table, not the document: a status the document
+declares without a schema does not appear, because nothing will be
+checked for it.
+
+=head2 operation_doc
+
+    my $doc = $api->operation_doc('getPet');
+
+What the document B<says> about an operation, as opposed to what the validator
+made of it: C<operationId>, C<method>, C<path>, C<summary>, C<description>,
+C<tags>, C<deprecated>, and any C<x-> extension keys the operation carried.
+C<undef> for an unknown id.
+
+L</operation_info> is the companion. That one reports what will be checked;
+this one reports what the operation was described as.
+
+=head2 operation_schema
+
+    my $schema = $api->operation_schema('getPet');
+
+Every input an operation declares, as one JSON Schema object: a property per
+parameter under its own name, plus C<body> for a JSON request body, with the
+required ones listed in C<required>. C<undef> for an unknown id.
+
+OpenAPI 3.1 schemas are JSON Schema 2020-12, and L</spec> is 3.1-shaped
+whatever the source declared, so the result needs no translation and compiles
+as it stands:
+
+    my $v = JSON::Schema::Fast->compile($api->operation_schema('getPet'));
+
+C<$ref>s into C<components.schemas> are rewritten to C<$defs>, and only the
+schemas this operation can actually reach are carried, so one operation does
+not drag the whole document along with it. A parameter named C<body> would
+collide with the request body, so it is carried as C<param_body> and says so
+in its description.
+
+=head1 ERRORS
+
+Validation errors are hashrefs: the L<JSON::Schema::Fast> output fields
+(C<instanceLocation>, C<keyword>, C<schemaLocation>, C<message>) augmented
+with C<in> (path / query / header / cookie / body / response) and C<name>
+(the parameter name). Missing required inputs use C<< keyword => 'required' >>;
+an undecodable JSON body uses C<< keyword => 'json' >>.
+
+=head1 ARCHITECTURE
+
+Open::API is a consumer of two runtime-resolved C ABIs, the same DBI-style
+versioned function-pointer tables used across the Semantic stack:
+
+=over 4
+
+=item * L<JSON::Schema::Fast> (required) - schemas are compiled once through
+C<jsf_abi.h> and every validation on the request path is a direct C call.
+Resolved and version-checked at load; absence is a hard error.
+
+=item * L<Fetch> (optional) - L<Open::API::Client> fires requests through
+C<fetch_abi.h>. Resolved lazily on first client construction; the server side
+never loads it.
+
+=back
+
+It is also a B<provider> of one: C<include/oa_abi.h> exposes the router and
+validator to another XS module's own C dispatcher, so an operation is routed
+and validated with no Perl frame between the socket and the controller. See
+L</C ABI> below.
+
+There is no link-time coupling: each distribution builds and upgrades
+independently, and a version skew fails cleanly at boot (t/12-abi-guard.t on
+the consumer side, t/25-abi.t for the provider table).
+
+=head1 C ABI
+
+C<include/oa_abi.h> is the C form of L</match> and L</validate_request>: a
+versioned function-pointer table resolved at B<runtime>, in the DBI style used
+across the Semantic stack. There is no link-time symbol coupling, so provider
+and consumer build and upgrade independently. L<Punk> is the first consumer -
+its C dispatcher routes, validates and hands the typed parameters to a
+controller without unwinding into Perl.
+
+=head2 Getting the header
+
+Open::API installs C<oa_abi.h> through L<ExtUtils::Depends>, so a consumer's
+F<Makefile.PL> picks up the include path with no vendoring:
+
+    use ExtUtils::Depends;
+    my $pkg = ExtUtils::Depends->new('My::Consumer', 'Open::API');
+    WriteMakefile(
+        ...
+        $pkg->get_makefile_vars,   # INC reaches oa_abi.h
+        PREREQ_PM => { 'Open::API' => '0.04' },
+    );
+
+The alternative is to vendor a copy of the header pinned at a known
+C<OA_ABI_VERSION>. Either way the header only declares the table; nothing is
+linked.
+
+Perl's own headers (F<EXTERN.h>, F<perl.h>, F<XSUB.h>) must be included before
+C<oa_abi.h>, which needs C<SV>, C<AV>, C<HV>, C<STRLEN> and C<pTHX>.
+
+=head2 Resolving the table
+
+C<Open::API::_abi_ptr> returns the address of the process-wide table as an IV.
+It is not a Perl-level API - it is the ABI entry point, and the only supported
+thing to do with it is C<INT2PTR> it back to a C<< const oa_abi * >> and check
+C<abi_version> before the first call:
+
+    #include "oa_abi.h"
+
+    static const oa_abi *OA = NULL;
+
+    static const oa_abi *my_oa(pTHX) {
+        if (!OA) {
+            IV p = 0;
+            dSP;
+            eval_pv("require Open::API;", FALSE);
+            SPAGAIN;                    /* the require may have moved the stack */
+            if (!SvTRUE(ERRSV)) {
+                ENTER; SAVETMPS; PUSHMARK(SP); PUTBACK;
+                if (call_pv("Open::API::_abi_ptr", G_SCALAR | G_EVAL) > 0) {
+                    SPAGAIN;
+                    p = POPi;
+                }
+                PUTBACK; FREETMPS; LEAVE;
+            }
+            if (p) {
+                const oa_abi *a = INT2PTR(const oa_abi *, p);
+                if (a && a->abi_version == OA_ABI_VERSION) OA = a;
+            }
+        }
+        return OA;   /* NULL means: use the Perl-visible methods instead */
+    }
+
+The address is static for the life of the process, so resolve it once at boot
+and cache it. The IV may legitimately be negative on platforms that map shared
+objects high in the address space; C<INT2PTR> round-trips the bits either way,
+so test for non-zero, not for positive.
+
+A NULL result means Open::API is absent, too old, or built without the table.
+That is not an error in itself - the documented answer is to fall back to
+L</match> and L</validate_request>, which do the same work with Perl frames.
+A consumer that hard-requires the ABI should croak at boot, not per request.
+
+=head2 The table
+
+    typedef struct oa_abi {
+        int abi_version;
+        void *(*api_of)   (pTHX_ SV *api_sv);
+        void *(*route)    (pTHX_ void *api, const char *method, STRLEN mlen,
+                           const char *path, STRLEN plen, HV *caps, AV *allow);
+        void *(*op_by_id) (pTHX_ void *api, SV *op_id);
+        int   (*validate) (pTHX_ void *api, void *op, HV *raw, HV *typed,
+                           AV *errors);
+        SV   *(*op_id)    (pTHX_ void *op);
+    } oa_abi;
+
+=over 4
+
+=item * C<abi_version> - equals C<OA_ABI_VERSION> in the header the provider
+was built with. Compare it before calling anything else.
+
+=item * C<api_of> - the opaque API handle behind a blessed Open::API SV (what
+L</new> returns). Returns NULL when the SV is not a reference; it never
+croaks, so it is safe on the fall-back path. The handle lives as long as the
+SV does and is not freed by the caller.
+
+=item * C<route> - the C form of L</match>. C<method> and C<path> are given
+with explicit lengths, and C<path> is the request path only, already
+prefix-stripped by the caller (a mount strips its own prefix). On a match it
+returns the opaque operation handle and fills C<caps> with the raw captured
+path segments (name =E<gt> borrowed value SV). On a 405 - the path exists but
+not for this method - it returns NULL and fills C<allow> with the upper-case
+method names, an AV of SVs. On a 404 it returns NULL and leaves C<allow>
+empty. C<caps> and C<allow> are caller-owned and must be empty on entry;
+either may be NULL to discard that output.
+
+=item * C<op_by_id> - the opaque operation handle for an operationId, for a
+consumer that dispatches by name rather than by path. NULL when the id is
+unknown.
+
+=item * C<validate> - the C form of L</validate_request>. C<raw> is the same
+hash that method documents:
+
+    { path   => \%captures,           # e.g. the caps from route()
+      query  => $query_string | \%hash,
+      header => \%lowercased_headers, # cookies ride the "cookie" header
+      body   => $raw_bytes | $decoded_ref }
+
+On success it fills C<typed> with the validated, coerced, percent-decoded
+parameters (the path/query/header/cookie hashes and the body, exactly the
+shape L</validate_request> returns) and returns 1. On failure it pushes error
+hashrefs - the L</ERRORS> shape - into C<errors> and returns 0. Both
+containers are caller-owned and should be empty on entry; either may be NULL
+to discard it, and a NULL C<typed> validates without materialising the
+parameters.
+
+=item * C<op_id> - the operationId SV of a routed operation. It is borrowed:
+do not free it, and copy it if it must outlive the API object.
+
+=back
+
+Every call takes C<pTHX_> and must be made on the interpreter that owns the
+API SV. The table itself is C<const> and shared; the handles it hands back are
+owned by the Open::API object, so keep that object alive for as long as the
+dispatcher uses them.
+
+=head2 Versioning
+
+The table only ever grows at the end. C<OA_ABI_VERSION> bumps on any append,
+and a consumer requires C<abi_version> to equal the version it was written
+against, or to be greater than it if it treats a later table as a superset and
+uses only the prefix it knows. Fields are never reordered, retyped or removed
+within a major line, so a consumer built against version I<N> keeps working
+against any provider that still reports I<N>.
+
+The provider table is exercised end to end by F<t/25-abi.t>, which drives
+C<api_of>, C<route>, C<op_id> and C<validate> through the pointers and asserts
+the results match the Perl-visible L</match> and L</validate_request> - the
+ABI is the same behaviour with the Perl frames removed.
+
+=head1 SEE ALSO
+
+L<Open::API::Plack>, L<Open::API::Client>, L<JSON::Schema::Fast>, L<Fetch>,
+L<Hyperman>, L<Punk>.
+
+=head1 AUTHOR
+
+LNATION <email@lnation.org>
+
+=head1 BUGS
+
+Please report any bugs or feature requests to C<bug-open-api at rt.cpan.org>, or through
+the web interface at L<https://rt.cpan.org/NoAuth/ReportBug.html?Queue=Open-API>.  I will be notified, and then you'll
+automatically be notified of progress on your bug as I make changes.
+
+=head1 SUPPORT
+
+You can find documentation for this module with the perldoc command.
+
+    perldoc Open::API
+
+You can also look for information at:
+
+=over 4
+
+=item * RT: CPAN's request tracker (report bugs here)
+
+L<https://rt.cpan.org/NoAuth/Bugs.html?Dist=Open-API>
+
+=item * Search CPAN
+
+L<https://metacpan.org/release/Open-API>
+
+=back
+
+=head1 LICENSE AND COPYRIGHT
+
+This software is Copyright (c) 2026 by LNATION <email@lnation.org>.
+
+This is free software, licensed under:
+
+  The Artistic License 2.0 (GPL Compatible)
+
+=cut
